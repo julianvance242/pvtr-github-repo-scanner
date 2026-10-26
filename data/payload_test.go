@@ -2,7 +2,6 @@ package data
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -148,33 +147,43 @@ func TestFetchWorkflowFiles(t *testing.T) {
 	})
 }
 
-func TestFetchGraphqlRepoTreeFallsBackByLevel(t *testing.T) {
+func TestFetchGraphqlRepoTreeFallsBackToBatches(t *testing.T) {
 	cfg := &config.Config{Logger: hclog.NewNullLogger()}
-	// Each directory's listing, keyed by the object expression the query asks for.
-	levels := map[string]string{
-		"HEAD:":          `[{"name":"README.md","type":"blob","path":"README.md","mode":33188,"object":{"isBinary":false,"isTruncated":false}},{"name":"bin","type":"tree","path":"bin","mode":16384,"object":{}}]`,
-		"HEAD:bin":       `[{"name":"tool","type":"blob","path":"bin/tool","mode":33261,"object":{"isBinary":true,"isTruncated":false}},{"name":"sub","type":"tree","path":"bin/sub","mode":16384,"object":{}}]`,
-		"HEAD:bin/sub":   `[{"name":"deep","type":"blob","path":"bin/sub/deep","mode":33261,"object":{"isBinary":true,"isTruncated":false}},{"name":"x","type":"tree","path":"bin/sub/x","mode":16384,"object":{}}]`,
-		"HEAD:bin/sub/x": `[{"name":"too-deep","type":"blob","path":"bin/sub/x/too-deep","mode":33261,"object":{"isBinary":true,"isTruncated":false}}]`,
-	}
+	shape := `{"data":{"repository":{"object":{"entries":[` +
+		`{"name":"README.md","type":"blob","path":"README.md","mode":33188,"object":{}},` +
+		`{"name":"logo.png","type":"blob","path":"logo.png","mode":33261,"object":{}},` +
+		`{"name":"bin","type":"tree","path":"bin","mode":16384,"object":{"entries":[` +
+		`{"name":"tool","type":"blob","path":"bin/tool","mode":33261,"object":{}},` +
+		`{"name":"sub","type":"tree","path":"bin/sub","mode":16384,"object":{"entries":[` +
+		`{"name":"deep","type":"blob","path":"bin/sub/deep","mode":33261}]}}]}}]}}}}`
+	binary := map[string]bool{"HEAD:bin/tool": true, "HEAD:bin/sub/deep": true}
 	var mu sync.Mutex
-	var asked []string
+	var batched []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Query     string
-			Variables struct{ Branch string }
+			Variables map[string]string
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		mu.Lock()
-		asked = append(asked, req.Variables.Branch)
-		mu.Unlock()
-		if strings.Count(req.Query, "entries") > 1 {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(req.Query, "b0:"):
+			objects := map[string]any{}
+			for name, expr := range req.Variables {
+				if strings.HasPrefix(name, "p") {
+					mu.Lock()
+					batched = append(batched, expr)
+					mu.Unlock()
+					objects["b"+name[1:]] = map[string]any{"isBinary": binary[expr], "isTruncated": false}
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": objects}})
+		case strings.Contains(req.Query, "isBinary"):
 			// The full three-level query: what GitHub does to a large repository.
 			w.WriteHeader(http.StatusBadGateway)
-			return
+		default:
+			_, _ = w.Write([]byte(shape))
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"data":{"repository":{"object":{"entries":%s}}}}`, levels[req.Variables.Branch])
 	}))
 	t.Cleanup(server.Close)
 	client := githubv4.NewEnterpriseClient(server.URL, server.Client())
@@ -185,5 +194,6 @@ func TestFetchGraphqlRepoTreeFallsBackByLevel(t *testing.T) {
 	binaries, err := checkTreeForBinaries(tree, &binaryChecker{logger: cfg.Logger})
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"tool", "deep"}, binaries)
-	assert.NotContains(t, asked, "HEAD:bin/sub/x", "the fallback must stop at the same depth as the full query")
+	assert.ElementsMatch(t, []string{"HEAD:README.md", "HEAD:bin/tool", "HEAD:bin/sub/deep"}, batched,
+		"every blob but acceptable binary formats is batched, at the same depth as the full query")
 }

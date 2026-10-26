@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -348,127 +349,171 @@ func fetchGraphqlRepoTree(config *config.Config, client *githubv4.Client, branch
 	err = client.Query(context.Background(), &tree, variables)
 	if err != nil {
 		// GitHub computes IsBinary for every blob in the one query, so a large
-		// repository exceeds GitHub's GraphQL time limit and gets a 502. Small
-		// per-directory queries stay under it and cover the same three levels.
-		config.Logger.Warn(fmt.Sprintf("repository tree query failed, retrying one directory at a time: %s", err.Error()))
-		return fetchGraphqlRepoTreeByLevel(config, client, branch)
+		// repository exceeds GitHub's GraphQL time limit and gets a 502.
+		config.Logger.Warn(fmt.Sprintf("repository tree query failed, retrying in batches: %s", err.Error()))
+		return fetchGraphqlRepoTreeBatched(config, client, branch)
 	}
 	return tree, nil
 }
 
-// graphqlTreeLevel lists a single directory, for fetchGraphqlRepoTreeByLevel.
-type graphqlTreeLevel struct {
+// treeBlob is the Blob fragment shared by every level of GraphqlRepoTree.
+type treeBlob = struct {
+	IsBinary    *bool
+	IsTruncated bool
+}
+
+type shapeEntry struct {
+	Name string
+	Type string
+	Path string
+	Mode int
+}
+
+// graphqlRepoShape is GraphqlRepoTree without the Blob fields: the same three
+// levels, but cheap enough for GitHub to answer on large repositories.
+type graphqlRepoShape struct {
 	Repository struct {
 		Object struct {
 			Tree struct {
-				Entries []treeLevelEntry
+				Entries []struct {
+					shapeEntry `graphql:"... on TreeEntry"`
+					Object     struct {
+						Tree struct {
+							Entries []struct {
+								shapeEntry `graphql:"... on TreeEntry"`
+								Object     struct {
+									Tree struct {
+										Entries []shapeEntry
+									} `graphql:"... on Tree"`
+								} `graphql:"object"`
+							}
+						} `graphql:"... on Tree"`
+					} `graphql:"object"`
+				}
 			} `graphql:"... on Tree"`
 		} `graphql:"object(expression: $branch)"`
 	} `graphql:"repository(owner: $owner, name: $name)"`
 }
 
-type treeLevelEntry struct {
-	Name   string
-	Type   string
-	Path   string
-	Mode   int
-	Object *struct {
-		Blob struct {
-			IsBinary    *bool
-			IsTruncated bool
-		} `graphql:"... on Blob"`
-	} `graphql:"object"`
+// blobRef points at the IsBinary slot of one blob in a GraphqlRepoTree.
+type blobRef struct {
+	path string
+	blob *treeBlob
 }
 
-// treeLevelConcurrency bounds the parallel directory queries, to stay clear of
-// GitHub's secondary rate limits.
-const treeLevelConcurrency = 8
-
-func fetchTreeLevel(config *config.Config, client *githubv4.Client, sem chan struct{}, branch, path string) ([]treeLevelEntry, error) {
-	sem <- struct{}{}
-	defer func() { <-sem }()
-	var level graphqlTreeLevel
-	variables := map[string]any{
-		"owner":  githubv4.String(config.GetString("owner")),
-		"name":   githubv4.String(config.GetString("repo")),
-		"branch": githubv4.String(fmt.Sprintf("%s:%s", branch, path)),
-	}
-	if err := client.Query(context.Background(), &level, variables); err != nil {
-		return nil, fmt.Errorf("failed to list %q: %w", path, err)
-	}
-	return level.Repository.Object.Tree.Entries, nil
-}
+const (
+	// isBinaryBatchSize blobs per query: 100 took about 3s on meshery, well
+	// under GitHub's limit; 200 took up to 7s.
+	isBinaryBatchSize = 100
+	// isBinaryConcurrency bounds parallel batch queries, to stay clear of
+	// GitHub's secondary rate limits.
+	isBinaryConcurrency = 4
+)
 
 // alloc returns a new zero value of the type p points to, so the anonymous
 // nested types of GraphqlRepoTree can be filled without spelling them out.
 func alloc[T any](_ *T) *T { return new(T) }
 
-// fetchGraphqlRepoTreeByLevel builds the same three-level GraphqlRepoTree as
-// fetchGraphqlRepoTree, with one query per directory instead of one in total.
-func fetchGraphqlRepoTreeByLevel(config *config.Config, client *githubv4.Client, branch string) (*GraphqlRepoTree, error) {
-	sem := make(chan struct{}, treeLevelConcurrency)
-	level1, err := fetchTreeLevel(config, client, sem, branch, "")
-	if err != nil {
+// fetchGraphqlRepoTreeBatched builds the same GraphqlRepoTree as
+// fetchGraphqlRepoTree from one query for the tree's shape plus one query per
+// isBinaryBatchSize blobs for their IsBinary.
+func fetchGraphqlRepoTreeBatched(config *config.Config, client *githubv4.Client, branch string) (*GraphqlRepoTree, error) {
+	var shape graphqlRepoShape
+	variables := map[string]any{
+		"owner":  githubv4.String(config.GetString("owner")),
+		"name":   githubv4.String(config.GetString("repo")),
+		"branch": githubv4.String(branch + ":"),
+	}
+	if err := client.Query(context.Background(), &shape, variables); err != nil {
+		return nil, fmt.Errorf("failed to fetch repository tree shape: %w", err)
+	}
+	tree, refs := treeFromShape(&shape)
+	if err := fetchIsBinary(config, client, branch, refs); err != nil {
 		return nil, err
 	}
-	tree := &GraphqlRepoTree{}
-	entries1 := slices.Grow(tree.Repository.Object.Tree.Entries, len(level1))[:len(level1)]
-	tree.Repository.Object.Tree.Entries = entries1
+	return tree, nil
+}
 
-	// Every goroutine fills only the entries of the directory it listed.
-	g := new(errgroup.Group)
-	for i, src1 := range level1 {
+// treeFromShape copies the shape into a GraphqlRepoTree and returns the blobs
+// whose IsBinary the binary checks read. Acceptable binary formats are never
+// flagged by either check, so they are left unfetched.
+func treeFromShape(shape *graphqlRepoShape) (*GraphqlRepoTree, []blobRef) {
+	var refs []blobRef
+	track := func(e shapeEntry, blob *treeBlob) {
+		if e.Type == "blob" && !acceptableBinaryExtension(e.Path) {
+			refs = append(refs, blobRef{e.Path, blob})
+		}
+	}
+	tree := &GraphqlRepoTree{}
+	src1 := shape.Repository.Object.Tree.Entries
+	entries1 := slices.Grow(tree.Repository.Object.Tree.Entries, len(src1))[:len(src1)]
+	tree.Repository.Object.Tree.Entries = entries1
+	for i, s1 := range src1 {
 		e1 := &entries1[i]
-		e1.Name, e1.Type, e1.Path, e1.Mode = src1.Name, src1.Type, src1.Path, src1.Mode
-		if src1.Object == nil {
-			continue
-		}
+		e1.Name, e1.Type, e1.Path, e1.Mode = s1.Name, s1.Type, s1.Path, s1.Mode
 		e1.Object = alloc(e1.Object)
-		e1.Object.Blob = src1.Object.Blob
-		if src1.Type != "tree" {
-			continue
-		}
-		g.Go(func() error {
-			level2, err := fetchTreeLevel(config, client, sem, branch, src1.Path)
-			if err != nil {
-				return err
+		track(s1.shapeEntry, &e1.Object.Blob)
+
+		src2 := s1.Object.Tree.Entries
+		entries2 := slices.Grow(e1.Object.Tree.Entries, len(src2))[:len(src2)]
+		e1.Object.Tree.Entries = entries2
+		for j, s2 := range src2 {
+			e2 := &entries2[j]
+			e2.Name, e2.Type, e2.Path, e2.Mode = s2.Name, s2.Type, s2.Path, s2.Mode
+			e2.Object = alloc(e2.Object)
+			track(s2.shapeEntry, &e2.Object.Blob)
+
+			src3 := s2.Object.Tree.Entries
+			entries3 := slices.Grow(e2.Object.Tree.Entries, len(src3))[:len(src3)]
+			e2.Object.Tree.Entries = entries3
+			for k, s3 := range src3 {
+				e3 := &entries3[k]
+				e3.Name, e3.Type, e3.Path, e3.Mode = s3.Name, s3.Type, s3.Path, s3.Mode
+				e3.Object = alloc(e3.Object)
+				track(s3, &e3.Object.Blob)
 			}
-			entries2 := slices.Grow(e1.Object.Tree.Entries, len(level2))[:len(level2)]
-			e1.Object.Tree.Entries = entries2
-			for j, src2 := range level2 {
-				e2 := &entries2[j]
-				e2.Name, e2.Type, e2.Path, e2.Mode = src2.Name, src2.Type, src2.Path, src2.Mode
-				if src2.Object == nil {
-					continue
+		}
+	}
+	return tree, refs
+}
+
+// fetchIsBinary fills each ref's IsBinary and IsTruncated, asking for a batch
+// of blobs per query through aliased object(expression:) fields.
+func fetchIsBinary(config *config.Config, client *githubv4.Client, branch string, refs []blobRef) error {
+	blobObject := reflect.TypeFor[struct {
+		Blob treeBlob `graphql:"... on Blob"`
+	}]()
+	g := new(errgroup.Group)
+	g.SetLimit(isBinaryConcurrency)
+	for batch := range slices.Chunk(refs, isBinaryBatchSize) {
+		g.Go(func() error {
+			fields := make([]reflect.StructField, len(batch))
+			variables := map[string]any{
+				"owner": githubv4.String(config.GetString("owner")),
+				"name":  githubv4.String(config.GetString("repo")),
+			}
+			for i, ref := range batch {
+				fields[i] = reflect.StructField{
+					Name: fmt.Sprintf("B%d", i),
+					Type: blobObject,
+					Tag:  reflect.StructTag(fmt.Sprintf(`graphql:"b%d: object(expression: $p%d)"`, i, i)),
 				}
-				e2.Object = alloc(e2.Object)
-				e2.Object.Blob = src2.Object.Blob
-				if src2.Type != "tree" {
-					continue
-				}
-				g.Go(func() error {
-					level3, err := fetchTreeLevel(config, client, sem, branch, src2.Path)
-					if err != nil {
-						return err
-					}
-					entries3 := slices.Grow(e2.Object.Tree.Entries, len(level3))[:len(level3)]
-					e2.Object.Tree.Entries = entries3
-					for k, src3 := range level3 {
-						e3 := &entries3[k]
-						e3.Name, e3.Type, e3.Path, e3.Mode = src3.Name, src3.Type, src3.Path, src3.Mode
-						if src3.Object != nil {
-							e3.Object = alloc(e3.Object)
-							e3.Object.Blob = src3.Object.Blob
-						}
-					}
-					return nil
-				})
+				variables[fmt.Sprintf("p%d", i)] = githubv4.String(branch + ":" + ref.path)
+			}
+			query := reflect.New(reflect.StructOf([]reflect.StructField{{
+				Name: "Repository",
+				Type: reflect.StructOf(fields),
+				Tag:  `graphql:"repository(owner: $owner, name: $name)"`,
+			}}))
+			if err := client.Query(context.Background(), query.Interface(), variables); err != nil {
+				return fmt.Errorf("failed to fetch binary status for %d files: %w", len(batch), err)
+			}
+			repo := query.Elem().Field(0)
+			for i, ref := range batch {
+				*ref.blob = repo.Field(i).Field(0).Interface().(treeBlob)
 			}
 			return nil
 		})
 	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	return tree, nil
+	return g.Wait()
 }
