@@ -122,7 +122,7 @@ func loadGateWorkflows(payload data.Payload, unmatched []executedCheck) (map[str
 		if !needed[path] || file.Truncated {
 			continue
 		}
-		workflow, err := actionlint.Parse([]byte(file.Content))
+		workflow, err := data.ParseWorkflow([]byte(file.Content))
 		if err != nil || workflow == nil {
 			continue
 		}
