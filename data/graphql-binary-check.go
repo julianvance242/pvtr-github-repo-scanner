@@ -347,13 +347,13 @@ func fetchGraphqlRepoTree(config *config.Config, client *githubv4.Client, branch
 	}
 
 	err = client.Query(context.Background(), &tree, variables)
-	if err != nil {
+	if err != nil && (isTransientError(err) || strings.Contains(err.Error(), "timeout")) {
 		// GitHub computes IsBinary for every blob in the one query, so a large
 		// repository exceeds GitHub's GraphQL time limit and gets a 502.
 		config.Logger.Warn(fmt.Sprintf("repository tree query failed, retrying in batches: %s", err.Error()))
 		return fetchGraphqlRepoTreeBatched(config, client, branch)
 	}
-	return tree, nil
+	return tree, err
 }
 
 // treeBlob is the Blob fragment shared by every level of GraphqlRepoTree.
@@ -367,6 +367,7 @@ type shapeEntry struct {
 	Type string
 	Path string
 	Mode int
+	Oid  string
 }
 
 // graphqlRepoShape is GraphqlRepoTree without the Blob fields: the same three
@@ -397,7 +398,7 @@ type graphqlRepoShape struct {
 
 // blobRef points at the IsBinary slot of one blob in a GraphqlRepoTree.
 type blobRef struct {
-	path string
+	oid  string
 	blob *treeBlob
 }
 
@@ -424,11 +425,14 @@ func fetchGraphqlRepoTreeBatched(config *config.Config, client *githubv4.Client,
 		"name":   githubv4.String(config.GetString("repo")),
 		"branch": githubv4.String(branch + ":"),
 	}
-	if err := client.Query(context.Background(), &shape, variables); err != nil {
+	err := withRetry(config.Logger, "GraphQL repository tree shape query", func() error {
+		return client.Query(context.Background(), &shape, variables)
+	})
+	if err != nil {
 		return nil, fmt.Errorf("failed to fetch repository tree shape: %w", err)
 	}
 	tree, refs := treeFromShape(&shape)
-	if err := fetchIsBinary(config, client, branch, refs); err != nil {
+	if err := fetchIsBinary(config, client, refs); err != nil {
 		return nil, err
 	}
 	return tree, nil
@@ -441,7 +445,7 @@ func treeFromShape(shape *graphqlRepoShape) (*GraphqlRepoTree, []blobRef) {
 	var refs []blobRef
 	track := func(e shapeEntry, blob *treeBlob) {
 		if e.Type == "blob" && !acceptableBinaryExtension(e.Path) {
-			refs = append(refs, blobRef{e.Path, blob})
+			refs = append(refs, blobRef{e.Oid, blob})
 		}
 	}
 	tree := &GraphqlRepoTree{}
@@ -478,12 +482,14 @@ func treeFromShape(shape *graphqlRepoShape) (*GraphqlRepoTree, []blobRef) {
 }
 
 // fetchIsBinary fills each ref's IsBinary and IsTruncated, asking for a batch
-// of blobs per query through aliased object(expression:) fields.
-func fetchIsBinary(config *config.Config, client *githubv4.Client, branch string, refs []blobRef) error {
+// of blobs per query through aliased object(oid:) fields. Looking blobs up by
+// oid pins every batch to the tree the shape query read, even if the branch
+// moves mid-scan.
+func fetchIsBinary(config *config.Config, client *githubv4.Client, refs []blobRef) error {
 	blobObject := reflect.TypeFor[struct {
 		Blob treeBlob `graphql:"... on Blob"`
 	}]()
-	g := new(errgroup.Group)
+	g, ctx := errgroup.WithContext(context.Background())
 	g.SetLimit(isBinaryConcurrency)
 	for batch := range slices.Chunk(refs, isBinaryBatchSize) {
 		g.Go(func() error {
@@ -496,16 +502,19 @@ func fetchIsBinary(config *config.Config, client *githubv4.Client, branch string
 				fields[i] = reflect.StructField{
 					Name: fmt.Sprintf("B%d", i),
 					Type: blobObject,
-					Tag:  reflect.StructTag(fmt.Sprintf(`graphql:"b%d: object(expression: $p%d)"`, i, i)),
+					Tag:  reflect.StructTag(fmt.Sprintf(`graphql:"b%d: object(oid: $p%d)"`, i, i)),
 				}
-				variables[fmt.Sprintf("p%d", i)] = githubv4.String(branch + ":" + ref.path)
+				variables[fmt.Sprintf("p%d", i)] = githubv4.GitObjectID(ref.oid)
 			}
 			query := reflect.New(reflect.StructOf([]reflect.StructField{{
 				Name: "Repository",
 				Type: reflect.StructOf(fields),
 				Tag:  `graphql:"repository(owner: $owner, name: $name)"`,
 			}}))
-			if err := client.Query(context.Background(), query.Interface(), variables); err != nil {
+			err := withRetry(config.Logger, "GraphQL binary status batch query", func() error {
+				return client.Query(ctx, query.Interface(), variables)
+			})
+			if err != nil {
 				return fmt.Errorf("failed to fetch binary status for %d files: %w", len(batch), err)
 			}
 			repo := query.Elem().Field(0)
