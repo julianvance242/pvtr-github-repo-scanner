@@ -237,8 +237,7 @@ func StatusChecksAreRequiredByBranchProtection(payload data.Payload) (result gem
 }
 
 func NoBinariesInRepo(payload data.Payload) (result gemara.Result, message string, confidence gemara.ConfidenceLevel) {
-	// TODO: This only checks the top 3 levels of the repository tree
-	// for common binary file extensions and it fails on very large repositories.
+	// TODO: This only checks the top 3 levels of the repository tree.
 	suspectedBinaries := payload.Binaries.Suspected
 	if payload.Binaries.Err != nil {
 		payload.Config.Logger.Trace(fmt.Sprintf("unexpected response while checking for binaries: %s", payload.Binaries.Err.Error()))

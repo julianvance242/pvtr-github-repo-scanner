@@ -1,8 +1,12 @@
 package data
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
 	hclog "github.com/hashicorp/go-hclog"
@@ -142,4 +146,44 @@ func TestFetchWorkflowFiles(t *testing.T) {
 			Content: "on: push",
 		}}, files)
 	})
+}
+
+func TestFetchGraphqlRepoTreeFallsBackByLevel(t *testing.T) {
+	cfg := &config.Config{Logger: hclog.NewNullLogger()}
+	// Each directory's listing, keyed by the object expression the query asks for.
+	levels := map[string]string{
+		"HEAD:":          `[{"name":"README.md","type":"blob","path":"README.md","mode":33188,"object":{"isBinary":false,"isTruncated":false}},{"name":"bin","type":"tree","path":"bin","mode":16384,"object":{}}]`,
+		"HEAD:bin":       `[{"name":"tool","type":"blob","path":"bin/tool","mode":33261,"object":{"isBinary":true,"isTruncated":false}},{"name":"sub","type":"tree","path":"bin/sub","mode":16384,"object":{}}]`,
+		"HEAD:bin/sub":   `[{"name":"deep","type":"blob","path":"bin/sub/deep","mode":33261,"object":{"isBinary":true,"isTruncated":false}},{"name":"x","type":"tree","path":"bin/sub/x","mode":16384,"object":{}}]`,
+		"HEAD:bin/sub/x": `[{"name":"too-deep","type":"blob","path":"bin/sub/x/too-deep","mode":33261,"object":{"isBinary":true,"isTruncated":false}}]`,
+	}
+	var mu sync.Mutex
+	var asked []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string
+			Variables struct{ Branch string }
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		asked = append(asked, req.Variables.Branch)
+		mu.Unlock()
+		if strings.Count(req.Query, "entries") > 1 {
+			// The full three-level query: what GitHub does to a large repository.
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":{"repository":{"object":{"entries":%s}}}}`, levels[req.Variables.Branch])
+	}))
+	t.Cleanup(server.Close)
+	client := githubv4.NewEnterpriseClient(server.URL, server.Client())
+
+	tree, err := fetchGraphqlRepoTree(cfg, client, "HEAD")
+	require.NoError(t, err)
+
+	binaries, err := checkTreeForBinaries(tree, &binaryChecker{logger: cfg.Logger})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"tool", "deep"}, binaries)
+	assert.NotContains(t, asked, "HEAD:bin/sub/x", "the fallback must stop at the same depth as the full query")
 }

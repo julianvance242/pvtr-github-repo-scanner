@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/privateerproj/privateer-sdk/config"
 	"github.com/shurcooL/githubv4"
+	"golang.org/x/sync/errgroup"
 )
 
 type GraphqlRepoTree struct {
@@ -345,6 +346,129 @@ func fetchGraphqlRepoTree(config *config.Config, client *githubv4.Client, branch
 	}
 
 	err = client.Query(context.Background(), &tree, variables)
+	if err != nil {
+		// GitHub computes IsBinary for every blob in the one query, so a large
+		// repository exceeds GitHub's GraphQL time limit and gets a 502. Small
+		// per-directory queries stay under it and cover the same three levels.
+		config.Logger.Warn(fmt.Sprintf("repository tree query failed, retrying one directory at a time: %s", err.Error()))
+		return fetchGraphqlRepoTreeByLevel(config, client, branch)
+	}
+	return tree, nil
+}
 
-	return tree, err
+// graphqlTreeLevel lists a single directory, for fetchGraphqlRepoTreeByLevel.
+type graphqlTreeLevel struct {
+	Repository struct {
+		Object struct {
+			Tree struct {
+				Entries []treeLevelEntry
+			} `graphql:"... on Tree"`
+		} `graphql:"object(expression: $branch)"`
+	} `graphql:"repository(owner: $owner, name: $name)"`
+}
+
+type treeLevelEntry struct {
+	Name   string
+	Type   string
+	Path   string
+	Mode   int
+	Object *struct {
+		Blob struct {
+			IsBinary    *bool
+			IsTruncated bool
+		} `graphql:"... on Blob"`
+	} `graphql:"object"`
+}
+
+// treeLevelConcurrency bounds the parallel directory queries, to stay clear of
+// GitHub's secondary rate limits.
+const treeLevelConcurrency = 8
+
+func fetchTreeLevel(config *config.Config, client *githubv4.Client, sem chan struct{}, branch, path string) ([]treeLevelEntry, error) {
+	sem <- struct{}{}
+	defer func() { <-sem }()
+	var level graphqlTreeLevel
+	variables := map[string]any{
+		"owner":  githubv4.String(config.GetString("owner")),
+		"name":   githubv4.String(config.GetString("repo")),
+		"branch": githubv4.String(fmt.Sprintf("%s:%s", branch, path)),
+	}
+	if err := client.Query(context.Background(), &level, variables); err != nil {
+		return nil, fmt.Errorf("failed to list %q: %w", path, err)
+	}
+	return level.Repository.Object.Tree.Entries, nil
+}
+
+// alloc returns a new zero value of the type p points to, so the anonymous
+// nested types of GraphqlRepoTree can be filled without spelling them out.
+func alloc[T any](_ *T) *T { return new(T) }
+
+// fetchGraphqlRepoTreeByLevel builds the same three-level GraphqlRepoTree as
+// fetchGraphqlRepoTree, with one query per directory instead of one in total.
+func fetchGraphqlRepoTreeByLevel(config *config.Config, client *githubv4.Client, branch string) (*GraphqlRepoTree, error) {
+	sem := make(chan struct{}, treeLevelConcurrency)
+	level1, err := fetchTreeLevel(config, client, sem, branch, "")
+	if err != nil {
+		return nil, err
+	}
+	tree := &GraphqlRepoTree{}
+	entries1 := slices.Grow(tree.Repository.Object.Tree.Entries, len(level1))[:len(level1)]
+	tree.Repository.Object.Tree.Entries = entries1
+
+	// Every goroutine fills only the entries of the directory it listed.
+	g := new(errgroup.Group)
+	for i, src1 := range level1 {
+		e1 := &entries1[i]
+		e1.Name, e1.Type, e1.Path, e1.Mode = src1.Name, src1.Type, src1.Path, src1.Mode
+		if src1.Object == nil {
+			continue
+		}
+		e1.Object = alloc(e1.Object)
+		e1.Object.Blob = src1.Object.Blob
+		if src1.Type != "tree" {
+			continue
+		}
+		g.Go(func() error {
+			level2, err := fetchTreeLevel(config, client, sem, branch, src1.Path)
+			if err != nil {
+				return err
+			}
+			entries2 := slices.Grow(e1.Object.Tree.Entries, len(level2))[:len(level2)]
+			e1.Object.Tree.Entries = entries2
+			for j, src2 := range level2 {
+				e2 := &entries2[j]
+				e2.Name, e2.Type, e2.Path, e2.Mode = src2.Name, src2.Type, src2.Path, src2.Mode
+				if src2.Object == nil {
+					continue
+				}
+				e2.Object = alloc(e2.Object)
+				e2.Object.Blob = src2.Object.Blob
+				if src2.Type != "tree" {
+					continue
+				}
+				g.Go(func() error {
+					level3, err := fetchTreeLevel(config, client, sem, branch, src2.Path)
+					if err != nil {
+						return err
+					}
+					entries3 := slices.Grow(e2.Object.Tree.Entries, len(level3))[:len(level3)]
+					e2.Object.Tree.Entries = entries3
+					for k, src3 := range level3 {
+						e3 := &entries3[k]
+						e3.Name, e3.Type, e3.Path, e3.Mode = src3.Name, src3.Type, src3.Path, src3.Mode
+						if src3.Object != nil {
+							e3.Object = alloc(e3.Object)
+							e3.Object.Blob = src3.Object.Blob
+						}
+					}
+					return nil
+				})
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return tree, nil
 }
